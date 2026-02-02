@@ -11,7 +11,7 @@ except ModuleNotFoundError:
     print("petsc4py not found")
     sys.exit()
 
-import pflare   # <--- PFLARE ENABLED
+import pflare  
 
 '''
 1D Burgers Equation
