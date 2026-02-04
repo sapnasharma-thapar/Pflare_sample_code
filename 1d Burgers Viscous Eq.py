@@ -64,6 +64,18 @@ with da.getVecArray(u) as arr:
         arr[i] = np.exp(-((x_loc - 0.3)**2) / (2 * 0.05**2))
 
 # --------------------------------------------------
+# Initial condition (Top Hat / Square Wave)
+# --------------------------------------------------
+# (xs, xe) = da.getRanges()[0]
+# with da.getVecArray(u) as arr:
+#     for i in range(xs, xe):
+#         x_loc = i * dx
+#         if 0.1 <= x_loc <= 0.4:
+#             arr[i] = 1.0
+#         else:
+#             arr[i] = 0.0
+            
+# --------------------------------------------------
 # Residual Function
 # --------------------------------------------------
 def formResidual(snes, x, f):
