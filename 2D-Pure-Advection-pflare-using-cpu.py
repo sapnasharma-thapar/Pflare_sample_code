@@ -108,16 +108,11 @@ ksp.setType(PETSc.KSP.Type.GMRES)
 
 pc = ksp.getPC()
 pc.setType("air")
-    
-    # 3. Configure via Global Options Database using the Prefix
-    # We set both 'pc_air_type' and just 'air_type' just in case the binding is loose
+   
 opts = PETSc.Options()
     
-    # The Prefix is "my_solver_", so options must look like:
-    # -my_solver_pc_air_type iair
-    
 opts["my_solver_pc_air_type"] = "saiair"
-opts["my_solver_pc_air_strong_threshold"] = 0.7  # High threshold = Safer (less aggressive)
+opts["my_solver_pc_air_strong_threshold"] = 0.7  
 opts["my_solver_pc_air_z_type"] = "product"
 opts["my_solver_pc_air_poly_degree"] = 1
 opts["my_solver_pc_air_reuse_interpolation"] = True
