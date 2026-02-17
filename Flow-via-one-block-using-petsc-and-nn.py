@@ -59,7 +59,6 @@ for j in range(ny):
 
 A.assemble()
 
-# ---- IMPORTANT: remove constant nullspace ----
 nullspace = PETSc.NullSpace().create(constant=True)
 A.setNullSpace(nullspace)
 
