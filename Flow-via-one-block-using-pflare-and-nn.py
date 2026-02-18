@@ -18,14 +18,14 @@ from AI4PDEs_utils import get_weights_linear_2D, create_solid_body_2D
 # ============================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("PyTorch device:", device)
+print("Device:", device)
 
 # ============================================================
 # PARAMETERS
 # ============================================================
 
 dt = 0.005
-dx = dy = 1.0
+dx = 1.0
 nu = 0.1
 ub = -1.0
 
@@ -33,29 +33,36 @@ nx, ny = 256, 64
 ntime = 2000
 N = nx * ny
 
-filepath = "hybrid_results"
-os.makedirs(filepath, exist_ok=True)
+os.makedirs("hybrid_results_air", exist_ok=True)
 
 [w1, w2, w3, wA, w_res, diag] = get_weights_linear_2D(dx)
 
 # ============================================================
-# PETSc MATRIX (Backend decided from terminal)
+# PETSc MATRIX (MATCH CNN LAPLACIAN)
 # ============================================================
 
-A = PETSc.Mat().create()
-A.setSizes([N, N])
-A.setPreallocationNNZ(5)
-A.setFromOptions()
+A = PETSc.Mat().createAIJ([N, N], nnz=9)
 A.setUp()
+
+# Flip sign because w1 = -∇²
+kernel = -w1[0,0].cpu().numpy()
 
 for j in range(ny):
     for i in range(nx):
-        r = j * nx + i
-        A[r, r] = 4.0
-        if i > 0:      A[r, r-1]   = -1.0
-        if i < nx-1:   A[r, r+1]   = -1.0
-        if j > 0:      A[r, r-nx]  = -1.0
-        if j < ny-1:   A[r, r+nx]  = -1.0
+
+        row = j * nx + i
+
+        for dj in [-1,0,1]:
+            for di in [-1,0,1]:
+
+                ni = i + di
+                nj = j + dj
+
+                weight = kernel[dj+1, di+1]
+
+                if 0 <= ni < nx and 0 <= nj < ny:
+                    col = nj * nx + ni
+                    A[row, col] = weight
 
 A.assemble()
 
@@ -76,19 +83,8 @@ pc.setType("air")
 ksp.setTolerances(rtol=1e-6)
 ksp.setFromOptions()
 
-# ============================================================
-# VECTORS 
-# ============================================================
-
-b_vec = PETSc.Vec().create()
-b_vec.setSizes(N)
-b_vec.setFromOptions()
-b_vec.setUp()
-
-x_vec = PETSc.Vec().create()
-x_vec.setSizes(N)
-x_vec.setFromOptions()
-x_vec.setUp()
+b_vec = PETSc.Vec().createSeq(N)
+x_vec = PETSc.Vec().createSeq(N)
 
 print("PETSc configured: GMRES + AIR")
 
@@ -126,6 +122,8 @@ sigma = create_solid_body_2D(
     int(ny/4), int(ny/4)
 ).to(device)
 
+indices = np.arange(N, dtype=np.int32)
+
 # ============================================================
 # SIMULATION
 # ============================================================
@@ -133,16 +131,12 @@ sigma = create_solid_body_2D(
 residuals = []
 gmres_iterations = []
 
-indices = np.arange(N, dtype=np.int32)
-
 torch.cuda.synchronize()
 start = time.time()
 
 with torch.no_grad():
 
     for t in range(1, ntime+1):
-
-        # ----- Advection + Diffusion -----
 
         ADx_u = model.ddx(u)
         ADy_u = model.ddy(u)
@@ -156,18 +150,13 @@ with torch.no_grad():
 
         u_star, v_star = model.solid_body(u_star,v_star,sigma,dt)
 
-        # ----- Pressure RHS -----
-
+        # Projection RHS
         div = -(model.ddx(u_star)+model.ddy(v_star))/dt
+        div_np = div[0,0].cpu().numpy().flatten()
 
-        if torch.isnan(div).any():
-            print("NaN detected at step", t)
-            break
+        # Compatibility condition
+        div_np -= np.mean(div_np)
 
-        div_np = div[0,0].detach().cpu().numpy().flatten()
-
-        # 🔥 GPU SAFE VECTOR FILL
-        b_vec.set(0.0)
         b_vec.setValues(indices, div_np)
         b_vec.assemble()
 
@@ -176,41 +165,61 @@ with torch.no_grad():
         gmres_iterations.append(ksp.getIterationNumber())
         residuals.append(ksp.getResidualNorm())
 
-        # Copy pressure back
         p_np = x_vec.getArray(readonly=True)
-
-        p_tensor = torch.from_numpy(
-            p_np.reshape(ny,nx).copy()   # avoid warning
+        p = torch.from_numpy(
+            p_np.reshape(ny,nx).copy()
         ).float().to(device).unsqueeze(0).unsqueeze(0)
 
-        p_tensor -= torch.mean(p_tensor)
+        p -= torch.mean(p)
 
-        # ----- Velocity correction -----
-
-        u = u_star - dt*model.ddx(p_tensor)
-        v = v_star - dt*model.ddy(p_tensor)
+        u = u_star - dt*model.ddx(p)
+        v = v_star - dt*model.ddy(p)
 
         u,v = model.solid_body(u,v,sigma,dt)
 
-        # ----- Boundary Conditions -----
-
+        # BC
         u[:,:,:,0] = ub
         v[:,:,:,0] = 0.0
-
         u[:,:,:,-1] = u[:,:,:,-2]
         v[:,:,:,-1] = v[:,:,:,-2]
-
         u[:,:,0,:] = 0.0
         u[:,:,-1,:] = 0.0
         v[:,:,0,:] = 0.0
         v[:,:,-1,:] = 0.0
 
         if t % 200 == 0:
-            print(f"Step {t} | Residual {ksp.getResidualNorm():.6e} | GMRES iters {ksp.getIterationNumber()}")
+            print(f"Step {t} | Residual {ksp.getResidualNorm():.3e}")
 
 torch.cuda.synchronize()
 end = time.time()
 
-print("Total runtime:", end-start)
+print("Runtime:", end-start)
 print("Average GMRES iterations:", np.mean(gmres_iterations))
-print("Simulation complete.")
+
+# ============================================================
+# PLOTTING 
+# ============================================================
+
+u_plot = u.detach().cpu()[0,0]
+v_plot = v.detach().cpu()[0,0]
+sigma_plot = sigma.detach().cpu()[0,0]
+
+# U velocity
+plt.figure(figsize=(14,4))
+plt.imshow(u_plot, origin='lower', cmap='jet')
+plt.colorbar()
+plt.contourf(sigma_plot.cpu(), levels=[0.5,1], colors='gray', alpha=0.7)
+plt.title("u velocity")
+plt.savefig("hybrid_results/u-pflare.png")
+plt.close()
+
+# V velocity
+plt.figure(figsize=(14,4))
+plt.imshow(v_plot, origin='lower', cmap='jet')
+plt.colorbar()
+plt.contourf(sigma_plot.cpu(), levels=[0.5,1], colors='gray', alpha=0.7)
+plt.title("v velocity")
+plt.savefig("hybrid_results/v-pflare.png")
+plt.close()
+
+print("Plots saved successfully.")
