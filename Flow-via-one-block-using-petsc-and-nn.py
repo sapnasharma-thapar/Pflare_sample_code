@@ -1,213 +1,300 @@
 import os
-import sys
 import numpy as np
 import time
 import torch
 import torch.nn as nn
+from petsc4py import PETSc
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import petsc4py
-petsc4py.init(sys.argv)
-from petsc4py import PETSc
-
-from AI4PDEs_utils import get_weights_linear_2D, create_solid_body_2D
-
-# ============================================================
-# DEVICE
-# ============================================================
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", device)
 
-# ============================================================
-# PARAMETERS
-# ============================================================
+from AI4PDEs_utils import create_tensors_2D, get_weights_linear_2D, create_solid_body_2D
+from AI4PDEs_bounds import boundary_condition_2D_u
+from AI4PDEs_bounds import boundary_condition_2D_v
+from AI4PDEs_bounds import boundary_condition_2D_p
 
-dt = 0.05
+
+# ---------------- Parameters ----------------
+dt = 0.005
 dx = 1.0
-nu = 0.05
+nu = 0.1
 ub = -1.0
+nx = 256
+ny = 64
+ntime = 5000
+n_check = 100
 
-nx, ny = 256, 64
-ntime = 2000
-N = nx * ny
+[w1, w2, w3, wA, _, _] = get_weights_linear_2D(dx)
 
-os.makedirs("hybrid_results", exist_ok=True)
-
-[w1, w2, w3, wA, w_res, diag] = get_weights_linear_2D(dx)
-
-# ============================================================
-# PETSc MATRIX (USE TRUE LAPLACIAN WITH CORRECT SIGN)
-# ============================================================
-
-A = PETSc.Mat().createAIJ([N, N], nnz=9)
-A.setUp()
-
-# IMPORTANT: Flip sign because w1 = -∇²
-kernel = -w1[0,0].cpu().numpy()
-
-for j in range(ny):
-    for i in range(nx):
-
-        row = j * nx + i
-
-        for dj in [-1,0,1]:
-            for di in [-1,0,1]:
-
-                ni = i + di
-                nj = j + dj
-
-                weight = kernel[dj+1, di+1]
-
-                if 0 <= ni < nx and 0 <= nj < ny:
-                    col = nj * nx + ni
-                    A[row, col] = weight
-
-A.assemble()
-
-nullspace = PETSc.NullSpace().create(constant=True)
-A.setNullSpace(nullspace)
 
 # ============================================================
-# KSP
+#                       MODEL
 # ============================================================
 
-ksp = PETSc.KSP().create()
-ksp.setOperators(A)
-ksp.setType("gmres")
-ksp.getPC().setType("gamg")
-ksp.setTolerances(rtol=1e-6)
-ksp.setFromOptions()
+class AI4CFD(nn.Module):
 
-b_vec = PETSc.Vec().createSeq(N)
-x_vec = PETSc.Vec().createSeq(N)
-
-# ============================================================
-# CNN OPERATORS
-# ============================================================
-
-class Operators(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ddx = nn.Conv2d(1,1,3,padding=1,bias=False)
-        self.ddy = nn.Conv2d(1,1,3,padding=1,bias=False)
-        self.lap = nn.Conv2d(1,1,3,padding=1,bias=False)
 
-        self.ddx.weight.data = w2
-        self.ddy.weight.data = w3
-        self.lap.weight.data = w1
+        self.dt = dt
+        self.nu = nu
 
-    def solid_body(self,u,v,sigma,dt):
-        return u/(1+dt*sigma), v/(1+dt*sigma)
+        # CNN operators
+        self.xadv = nn.Conv2d(1,1,3,1,0,bias=False).to(device)
+        self.yadv = nn.Conv2d(1,1,3,1,0,bias=False).to(device)
+        self.diff = nn.Conv2d(1,1,3,1,0,bias=False).to(device)
 
-model = Operators().to(device)
+        self.xadv.weight.data = w2.to(device)
+        self.yadv.weight.data = w3.to(device)
+        self.diff.weight.data = w1.to(device)
+
+        # PETSc solver (robust choice)
+        self.ksp = PETSc.KSP().create()
+        self.ksp.setType('gmres')
+        self.ksp.getPC().setType('gamg')
+        self.ksp.setTolerances(rtol=1e-6)
+
+        self._build_matrix()
+
+
+    # --------------------------------------------------------
+    # Build Laplacian matrix A (no zeroRows)
+    # --------------------------------------------------------
+    def _build_matrix(self):
+
+        N = nx * ny
+        stencil = wA.detach().cpu().numpy()[0,0]
+
+        A = PETSc.Mat().createAIJ([N, N])
+        A.setPreallocationNNZ(9)
+        A.setUp()
+
+        for j in range(ny):
+            for i in range(nx):
+
+                row = j * nx + i
+
+                # Dirichlet pressure at right boundary
+                if i == nx - 1:
+                    A.setValue(row, row, 1.0)
+                    continue
+
+                for sj in range(-1,2):
+                    for si in range(-1,2):
+
+                        ii = i + si
+                        jj = j + sj
+                        val = stencil[sj+1, si+1]
+
+                        if val == 0:
+                            continue
+
+                        # Neumann boundaries (simple reflection)
+                        if ii < 0: ii = 1
+                        if jj < 0: jj = 1
+                        if jj >= ny: jj = ny - 2
+                        if ii >= nx: continue
+
+                        col = jj * nx + ii
+                        A.setValue(row, col, val)
+
+        A.assemble()
+        self.A = A
+        self.ksp.setOperators(A)
+
+
+    # --------------------------------------------------------
+    # Solid body penalization
+    # --------------------------------------------------------
+    def solid_body(self, u, v, sigma):
+        u = u / (1 + self.dt * sigma)
+        v = v / (1 + self.dt * sigma)
+        return u, v
+    
+        # --------------------------------------------------------
+    # Print PETSc Matrix A
+    # --------------------------------------------------------
+    def print_matrix(self, rows_to_print=5, save_to_file=False, filename="A_matrix.txt"):
+        """
+        Print PETSc sparse matrix information and selected rows.
+        """
+
+        print("\n================ MATRIX INFO ================")
+        print("Matrix size:", self.A.getSize())
+        print("Total nonzeros:", int(self.A.getInfo()['nz_used']))
+        print("============================================\n")
+
+        nrows = self.A.getSize()[0]
+        rows_to_print = min(rows_to_print, nrows)
+
+        for row in range(rows_to_print):
+            cols, vals = self.A.getRow(row)
+
+            print(f"Row {row}:")
+            for c, v in zip(cols, vals):
+                print(f"  col {c:6d}  value {v: .6e}")
+
+            print("--------------------------------------------")
+
+        # Optional: Save full matrix
+        if save_to_file:
+            viewer = PETSc.Viewer().createASCII(filename)
+            self.A.view(viewer)
+            viewer.destroy()
+            print(f"\nFull matrix saved to {filename}")
+
+
+    # --------------------------------------------------------
+    # Pressure Solve
+    # --------------------------------------------------------
+    def solve_pressure(self, uu, vv, p):
+
+        N = nx * ny
+
+        div_u = self.xadv(uu) + self.yadv(vv)
+        b = -div_u / self.dt
+
+        b_np = b.detach().cpu().numpy().reshape(N)
+        p_np = p.detach().cpu().numpy().reshape(N)
+
+        # Enforce RHS = 0 at Dirichlet boundary
+        for j in range(ny):
+            row = j * nx + (nx - 1)
+            b_np[row] = 0.0
+
+        b_vec = PETSc.Vec().createWithArray(b_np)
+        p_vec = PETSc.Vec().createWithArray(p_np)
+
+        self.ksp.solve(b_vec, p_vec)
+
+        p_new = p_vec.getArray().reshape(ny,nx)
+
+        return torch.from_numpy(p_new)\
+                    .float()\
+                    .to(device)\
+                    .unsqueeze(0)\
+                    .unsqueeze(0)
+
+
+    # --------------------------------------------------------
+    # Forward Step
+    # --------------------------------------------------------
+    def forward(self, u, uu, v, vv, p, pp, sigma):
+
+        # Apply velocity BC
+        uu = boundary_condition_2D_u(u, uu, ub)
+        vv = boundary_condition_2D_v(v, vv, ub)
+
+        # Advection-diffusion
+        ADx_u = self.xadv(uu)
+        ADy_u = self.yadv(uu)
+        AD2_u = self.diff(uu)
+
+        ADx_v = self.xadv(vv)
+        ADy_v = self.yadv(vv)
+        AD2_v = self.diff(vv)
+
+        u_star = u + self.nu*AD2_u*self.dt - u*ADx_u*self.dt - v*ADy_u*self.dt
+        v_star = v + self.nu*AD2_v*self.dt - u*ADx_v*self.dt - v*ADy_v*self.dt
+
+        # Solid body
+        u_star, v_star = self.solid_body(u_star, v_star, sigma)
+
+        # Reapply BC
+        uu = boundary_condition_2D_u(u_star, uu, ub)
+        vv = boundary_condition_2D_v(v_star, vv, ub)
+
+        # Pressure solve
+        p = self.solve_pressure(uu, vv, p)
+
+        # Ghost pressure for gradient
+        pp = boundary_condition_2D_p(p, pp)
+
+        # Velocity correction
+        u = u_star - self.xadv(pp)*self.dt
+        v = v_star - self.yadv(pp)*self.dt
+
+        # Solid body again
+        u, v = self.solid_body(u, v, sigma)
+
+        return u, v, p
+
 
 # ============================================================
-# INITIAL CONDITIONS
+# INITIALIZATION
 # ============================================================
 
-u = torch.zeros((1,1,ny,nx), device=device)
-v = torch.zeros((1,1,ny,nx), device=device)
-u[:,:,:,0] = ub
+model = AI4CFD().to(device)
+model.print_matrix(rows_to_print=10)
+model.print_matrix(rows_to_print=5, save_to_file=True)
 
-sigma = create_solid_body_2D(
-    nx, ny,
-    int(nx/4), int(ny/2)+5,
-    int(ny/4), int(ny/4)
-).to(device)
+u, v, p, uu, vv, pp, _, _ = create_tensors_2D(nx, ny)
 
-indices = np.arange(N, dtype=np.int32)
+u = u.to(device)
+v = v.to(device)
+p = p.to(device)
+uu = uu.to(device)
+vv = vv.to(device)
+pp = pp.to(device)
 
-# ============================================================
-# SIMULATION
-# ============================================================
+# Laminar inlet
+u.fill_(-ub)
+v.fill_(0.0)
+p.fill_(0.0)
 
-torch.cuda.synchronize()
+# Bluff body
+cor_x = int(nx/4)
+cor_y = int(ny/2) + 5
+size_x = int(ny/4)
+size_y = int(ny/4)
+
+sigma = create_solid_body_2D(nx, ny, cor_x, cor_y, size_x, size_y).to(device)
+
+print("Starting solver...")
 start = time.time()
 
 with torch.no_grad():
-
     for t in range(1, ntime+1):
 
-        ADx_u = model.ddx(u)
-        ADy_u = model.ddy(u)
-        ADx_v = model.ddx(v)
-        ADy_v = model.ddy(v)
-        AD2_u = model.lap(u)
-        AD2_v = model.lap(v)
+        u, v, p = model(u, uu, v, vv, p, pp, sigma)
 
-        u_star = u + dt*(nu*AD2_u - u*ADx_u - v*ADy_u)
-        v_star = v + dt*(nu*AD2_v - u*ADx_v - v*ADy_v)
+        if t % n_check == 0:
+            its = model.ksp.getIterationNumber()
+            res = model.ksp.getResidualNorm()
+            print(f"Step {t} | Iterations: {its} | Residual: {res:.3e}")
 
-        u_star, v_star = model.solid_body(u_star,v_star,sigma,dt)
+print(f"Simulation complete in {time.time()-start:.2f} seconds.")
 
-        # Projection RHS
-        div = -(model.ddx(u_star) + model.ddy(v_star)) / dt
-        div_np = div[0,0].cpu().numpy().flatten()
 
-        # Compatibility condition
-        div_np -= np.mean(div_np)
+dvdx = model.xadv(boundary_condition_2D_v(v, vv, ub))
+dudy = model.yadv(boundary_condition_2D_u(u, uu, ub))
 
-        b_vec.setValues(indices, div_np)
-        b_vec.assemble()
-
-        ksp.solve(b_vec, x_vec)
-
-        p_np = x_vec.getArray(readonly=True)
-        p = torch.from_numpy(
-            p_np.reshape(ny,nx).copy()
-        ).float().to(device).unsqueeze(0).unsqueeze(0)
-
-        p -= torch.mean(p)
-
-        # Velocity correction
-        u = u_star - dt*model.ddx(p)
-        v = v_star - dt*model.ddy(p)
-
-        u, v = model.solid_body(u,v,sigma,dt)
-
-        # Boundary conditions
-        u[:,:,:,0] = ub
-        v[:,:,:,0] = 0.0
-        u[:,:,:,-1] = u[:,:,:,-2]
-        v[:,:,:,-1] = v[:,:,:,-2]
-        u[:,:,0,:] = 0.0
-        u[:,:,-1,:] = 0.0
-        v[:,:,0,:] = 0.0
-        v[:,:,-1,:] = 0.0
-
-        if t % 200 == 0:
-            print(f"Step {t} | Residual {ksp.getResidualNorm():.3e}")
-
-torch.cuda.synchronize()
-end = time.time()
-
-print("Runtime:", end-start)
+omega = dvdx - dudy
+omega_np = omega.detach().squeeze().cpu().numpy()
 
 # ============================================================
-# PLOTTING
+# Save Plots
 # ============================================================
 
-u_plot = u.detach().cpu()[0,0]
-v_plot = v.detach().cpu()[0,0]
-sigma_plot = sigma.detach().cpu()[0,0]
+u_np = u.squeeze().cpu().numpy()
+v_np = v.squeeze().cpu().numpy()
 
-# U velocity
-plt.figure(figsize=(14,4))
-plt.imshow(u_plot, origin='lower', cmap='jet')
+plt.figure(figsize=(15,6))
+plt.imshow(-u_np, cmap='viridis', aspect='auto')
 plt.colorbar()
-plt.contourf(sigma_plot.cpu(), levels=[0.5,1], colors='gray', alpha=0.7)
-plt.title("u velocity")
-plt.savefig("hybrid_results/u-petsc.png")
+plt.title("u component velocity (m/s)")
+plt.tight_layout()
+plt.savefig("u_velocity_new.png", dpi=300)
 plt.close()
 
-# V velocity
-plt.figure(figsize=(14,4))
-plt.imshow(v_plot, origin='lower', cmap='jet')
+plt.figure(figsize=(15,6))
+plt.imshow(-v_np, cmap='viridis', aspect='auto')
 plt.colorbar()
-plt.contourf(sigma_plot.cpu(), levels=[0.5,1], colors='gray', alpha=0.7)
-plt.title("v velocity")
-plt.savefig("hybrid_results/v-petsc.png")
+plt.title("v component velocity (m/s)")
+plt.tight_layout()
+plt.savefig("v_velocity_new.png", dpi=300)
 plt.close()
 
 print("Plots saved successfully.")
