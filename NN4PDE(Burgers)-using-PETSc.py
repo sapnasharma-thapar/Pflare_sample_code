@@ -20,7 +20,7 @@ from AI4PDEs_utils import get_weights_linear_2D
 dt = 0.05
 dx = 1.0 ; 
 dy = 1.0
-nu = 0.5 # Viscosity (Re in your previous code)
+nu = 0.5 
 nx = 256 ;
 ny = 256
 ntime = 100
