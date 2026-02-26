@@ -4,7 +4,7 @@ import time
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 
-# ---------------- Parameters (IDENTICAL) ----------------
+# ---------------- Parameters ----------------
 nx, ny = 256, 64
 dx = 1.0
 dy = 1.0
@@ -90,7 +90,7 @@ ksp_p = build_solver(L)
 ksp_diff = build_solver(A_diff)
 
 # ------------------------------------------------
-# Initialize fields (same as notebook)
+# Initialize fields
 # ------------------------------------------------
 u = PETSc.Vec().createSeq(N)
 v = PETSc.Vec().createSeq(N)
@@ -101,7 +101,7 @@ v.set(0.0)
 p.set(0.0)
 
 # ------------------------------------------------
-# Solid body (32x32 same placement)
+# Solid body (32x32)
 # ------------------------------------------------
 sigma = np.zeros((ny, nx))
 cor_x = nx // 4
@@ -132,7 +132,7 @@ for t in range(1, ntime+1):
     v_np = np.array(v.getArray()).reshape(ny, nx)
 
     # -------------------------------
-    # Boundary Conditions (MATCH NOTEBOOK)
+    # Boundary Conditions 
     # -------------------------------
 
     # Inlet (left)
@@ -149,7 +149,7 @@ for t in range(1, ntime+1):
     u_np[-1,:] = u_np[-2,:]
 
     # ------------------------------------------------
-    # Advection (central difference - same as before)
+    # Advection (central difference)
     # ------------------------------------------------
     u_adv = u_np.copy()
     v_adv = v_np.copy()
@@ -256,7 +256,7 @@ print("Animation saved as flow_animation.mp4")
 
 
 # ==========================================================
-# VISUALIZATION (Same plots as notebook)
+# VISUALIZATION 
 # ==========================================================
 
 u_np = np.array(u.getArray()).reshape(ny, nx)
